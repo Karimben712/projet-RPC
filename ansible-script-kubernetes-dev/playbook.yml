@@ -1,0 +1,305 @@
+---
+- name: Nettoyage et préparation d'un nœud master Kubernetes (local VM)
+  hosts: localhost
+  become: yes
+  gather_facts: no 
+  tasks:
+
+    - name: "Arrêter les services Kubernetes"
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+      ignore_errors: yes
+
+    - name: "Réinitialiser kubeadm"
+      shell: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: "Supprimer les paquets Kubernetes"
+      apt:
+        name:
+          - kubeadm
+          - kubectl
+          - kubelet
+          - kubernetes-cni
+          - kube*
+        state: absent
+        purge: yes
+        autoremove: yes
+        force: yes
+      ignore_errors: yes
+
+    - name: "Supprimer les dossiers Kubernetes"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/cni/bin
+        - /etc/kubernetes
+        - /root/.kube
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni
+        - /var/lib/cni
+        - /run/flannel
+        - /etc/flannel
+        - /var/run/kubernetes
+        - /run/kubeadm
+      ignore_errors: yes
+
+    - name: "Nettoyer iptables"
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+      ignore_errors: yes
+
+    - name: "Supprimer interfaces réseau CNI"
+      shell: |
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete docker0 2>/dev/null || true
+      ignore_errors: yes
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+    - name: Kill les processus sur les ports Kubernetes
+      shell: |
+        fuser -k 6443/tcp || true
+        fuser -k 10259/tcp || true
+        fuser -k 10257/tcp || true
+      ignore_errors: yes
+
+    - name: Nettoyer les manifests et données kubelet
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/manifests
+        - /var/lib/kubelet
+      ignore_errors: yes
+
+    - name: Démarrer kubelet
+      systemd:
+        name: kubelet
+        state: started
+      ignore_errors: yes
+
+    - name: Nettoyer le cache APT
+      apt:
+        autoclean: yes
+        autoremove: yes
+
+    - name: Mise à jour du système
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Installer Docker
+      apt:
+        name: docker.io
+        state: present
+
+    - name: Installer dépendances de Kubernetes
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+
+    - name: Désactiver le swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Charger modules kernel
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Appliquer les paramètres sysctl
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Installer containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Créer le répertoire containerd
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Générer la configuration containerd
+      shell: |
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+
+    - name: Redémarrer containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Ajout dossier pour clé kubernetes
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Télécharger la clé gpg kubernetes
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /tmp/k8s-release.key
+        mode: '0644'
+
+    - name: Conversion clé -> gpg
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Supprimer la clé temporaire
+      file:
+        path: /tmp/k8s-release.key
+        state: absent
+
+    - name: Ajout du dépôt kubernetes
+      copy:
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
+
+    - name: Mise à jour du cache apt après ajout du dépôt Kubernetes
+      apt:
+        update_cache: yes
+
+    - name: Installer Kubernetes 
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Bloquer les mises à jour automatiques
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+    - name: Stop kubelet service before init
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+    - name: Delete existing Kubernetes manifests (old static pods)
+      file:
+        path: /etc/kubernetes/manifests
+        state: absent
+      ignore_errors: yes
+
+    - name: Clean /var/lib/kubelet (old data)
+      file:
+        path: /var/lib/kubelet
+        state: absent
+      ignore_errors: yes
+
+    - name: Start kubelet service before init
+      systemd:
+        name: kubelet
+        state: started
+      ignore_errors: yes
+
+    - name: Initialisation du cluster kubernetes master
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      changed_when: "'initialized successfully' in kubeadm_init.stdout"
+
+    - name: Créer le dossier .kube dans /root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root           
+
+    - name: Copier admin.conf dans le répertoire utilisateur
+      copy: 
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Créer le dossier .kube dans /home/user
+      file:
+        path: /home/zk/.kube
+        state: directory
+        mode: '0700'
+        owner: zk
+        group: zk
+
+    - name: Copier admin.conf dans le répertoire utilisateur zk
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/zk/.kube/config
+        remote_src: yes
+        owner: zk
+        group: zk
+        mode: '0600'
+
+
+    - name: installer flannel CNI
+      shell: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Générer la commande join
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Afficher la commande pour joindre les nœuds workers
+      debug:
+        msg: "Commande pour joindre les nœuds workers au cluster : {{ join_command.stdout }}"
+
+    - name: Sauvegarder la commande join dans join-command.yml
+      copy:
+        content: |
+          join_command: "{{ join_command.stdout }}"
+        dest: ./join-command.yml
+        mode: '0644'
